@@ -1,4 +1,3 @@
-import streamlit as st
 import pandas as pd
 import numpy as np
 import os
@@ -20,8 +19,11 @@ import requests
 import json
 from sqlalchemy import create_engine
 
+encoder = SentenceTransformer('mixedbread-ai/mxbai-embed-large-v1', device='cuda')
+nlp = spacy.load('en_core_web_trf')
+nlp_ner = spacy.load('en_core_web_md')
 
-OLLAMA_URL = 'http://127.0.0.1:9565'
+OLLAMA_URL = 'http://127.0.0.1:11434'
 class OLLAMA:
     def __init__(self, OLLAMA_URL, model_name):
         self.model_name = model_name
@@ -32,7 +34,8 @@ class OLLAMA:
         data = {
             'model': self.model_name,
             'prompt': prompt,
-            'stream': False
+            'stream': False,
+            "options":{"temperature":0}
         }
 
         headers = {
@@ -44,7 +47,7 @@ class OLLAMA:
                              data = json.dumps(data),
                              headers = headers)
         query = resp.json()['response']
-        print(f'JSON resp: {query}')
+        # print(f'JSON resp: {query}')
         return query
 
 
@@ -73,7 +76,7 @@ def getSQLiteDBQueryResult(query):
         query_result = pd.DataFrame()
     return query_result
 
-def preprocess_table(question, schema, table_name):
+def preprocess_table(question, schema, table_name, top_k = 10):
     """
         This function generates embeddings for question and table schema and filters relevant columns for prompt creation
         following the the filteration components:
@@ -84,7 +87,7 @@ def preprocess_table(question, schema, table_name):
     column_embs, column_descriptions_typed = generate_embeddings(table_name, schema)
 
     # 1a) get top k columns
-    top_k_scores, top_k_indices = knn_(question, column_embs, top_k=8, threshold=0.0)
+    top_k_scores, top_k_indices = knn_(question, column_embs, top_k=top_k, threshold=0.0)
     topk_table_columns = {}
     table_column_names = set()
 
@@ -97,7 +100,7 @@ def preprocess_table(question, schema, table_name):
         table_column_names.add(f'{table_name}.{column_tuple[0]}')
     
     # 1b) get columns which match terms in question
-    nlp = spacy.load('en_core_web_trf')
+    # nlp = spacy.load('en_core_web_trf')
     question_doc = nlp(question)
     q_filtered_tokens = [token.lemma_.lower() for token in question_doc if not token.is_stop]
     q_alpha_tokens = [i for i in q_filtered_tokens if (len(i)>1 and i.isalpha())]
@@ -109,7 +112,7 @@ def preprocess_table(question, schema, table_name):
     
     time_in_q = False
 
-    nlp_ner = spacy.load('en_core_web_md')
+    # nlp_ner = spacy.load('en_core_web_md')
     q_ner_doc = nlp_ner(question)
     ent_types = [w.label_ for w in q_ner_doc.ents]
 
@@ -150,7 +153,7 @@ def preprocess_table(question, schema, table_name):
 
     # 4) format metadata string
     pruned_schema = format_topk_sql(topk_table_columns, shuffle=False)
-    print(f'Pruned schema: {pruned_schema}')
+    # print(f'Pruned schema: {pruned_schema}')
     return pruned_schema
 
 def generate_embeddings(table_name, schema):
@@ -164,7 +167,7 @@ def generate_embeddings(table_name, schema):
         num_cols += 1
         TAB_DETAILS.append([table_name, col.alias_or_name, col.find(sqlglot.exp.DataType).__str__(), col.find(sqlglot.exp.ColumnConstraint)])
     
-    encoder = SentenceTransformer('mixedbread-ai/mxbai-embed-large-v1', device='cpu')
+    # encoder = SentenceTransformer('mixedbread-ai/mxbai-embed-large-v1', device='cpu')
 
     column_descriptions = []
     column_descriptions_typed = []
@@ -176,15 +179,15 @@ def generate_embeddings(table_name, schema):
         column_descriptions.append(col_str)
         column_descriptions_typed.append(col_str_typed)
 
-    column_embs = encoder.encode(column_descriptions, convert_to_tensor=True, device='cpu')
+    column_embs = encoder.encode(column_descriptions, convert_to_tensor=True, device='cuda')
     return column_embs, column_descriptions_typed
 
 def knn_(query, all_embs, top_k, threshold):
     """
         Find top k similar embedding using cosine simiarlity
     """
-    encoder = SentenceTransformer('mixedbread-ai/mxbai-embed-large-v1', device='cpu')
-    query_emb = encoder.encode(query, convert_to_tensor=True, device='cpu').unsqueeze(0)
+    # encoder = SentenceTransformer('mixedbread-ai/mxbai-embed-large-v1', device='cpu')
+    query_emb = encoder.encode(query, convert_to_tensor=True, device='cuda').unsqueeze(0)
     similarity_scores = F.cosine_similarity(query_emb, all_embs)
     top_results = torch.nonzero(similarity_scores > threshold).squeeze()
 
@@ -237,7 +240,7 @@ class queryPostprocessing:
         self.table_metadata = table_metadata
         self.col_mapping = {}
         self.table_mapping = {}
-        self.embedding_model = SentenceTransformer(embedding_model_name, device='cpu')
+        self.embedding_model = encoder
     
     def getIncorrectColumns(self):
         """
@@ -345,12 +348,15 @@ class queryPostprocessing:
         return query_ast.sql(dialect='snowflake')
 
 
-def getModelResult(schema, question, model_name, selected_table, table_columns):
+def getModelResult(schema, question, model_name, selected_table, table_columns, top_k=10):
     embedding_model_name = 'mixedbread-ai/mxbai-embed-large-v1'
     try:
         print('Running pre-processing...')
-        pruned_schema = preprocess_table(question=question, schema=schema, table_name=selected_table)
-        print(pruned_schema)
+        if len(table_columns)>top_k:
+            pruned_schema = preprocess_table(question=question, schema=schema, table_name=selected_table, top_k=top_k)
+        else:
+            pruned_schema = schema
+        # print(pruned_schema)
     except Exception as e:
         print('Pre-processing failed!')
         print(e, e.__traceback__)
@@ -376,17 +382,17 @@ def getModelResult(schema, question, model_name, selected_table, table_columns):
                         """
 
     prompt = prompt_template.format(question=question, db_schema=pruned_schema)
-    print(f'prompt: {prompt}')
-    print(f'Querying {model_name}...')
-    ollama = OLLAMA(OLLAMA_URL=OLLAMA_URL, model_name='sqlcoder')
+    # print(f'prompt: {prompt}')
+    # print(f'Querying {model_name}...')
+    ollama = OLLAMA(OLLAMA_URL=OLLAMA_URL, model_name=model_name)
     generated_query = ollama.run(prompt)
 
     if 'i do not know' in generated_query.lower():
         print('Failed to get SQL from model')
         return generated_query, prompt
-    print(f'Done! Generated query: {generated_query}')
+    # print(f'Done! Generated query: {generated_query}')
 
-    print('Running post-processing...')
+    # print('Running post-processing...')
     try:
         qp = queryPostprocessing(generated_query, {'table_name':selected_table, 'columns':table_columns}, embedding_model_name)
         processed_query = qp.formatQuerySQLglot()
@@ -395,5 +401,5 @@ def getModelResult(schema, question, model_name, selected_table, table_columns):
         print('Post-processing failed!')
         print(e, e.__traceback__)
         processed_query = generated_query
-    print(f'Done! Processed query: {processed_query}')
+    # print(f'Done! Processed query: {processed_query}')
     return processed_query, prompt
